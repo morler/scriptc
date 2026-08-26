@@ -1,7 +1,7 @@
 import { InternalCompilerError } from "./errors.js";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { buildCacheRoot, CcCompileError, clearCcCaches, compileC, compileLibArchive, executableNativeEnvironmentFingerprint, mobileLibraryTarget, mobileTargetRefusal, prepareBuildCacheRoot, pruneBuildCache, resolveCc, targetPlatform } from "./backend/native-toolchain.js";
+import { buildCacheRoot, CcCompileError, clearCcCaches, compileC, compileLibArchive, configuredTargetPlatform, executableNativeEnvironmentFingerprint, mobileLibraryTarget, mobileTargetRefusal, prepareBuildCacheRoot, pruneBuildCache, resolveCc, targetPlatform } from "./backend/native-toolchain.js";
 import { emitCModule } from "./backend/c/c-emitter.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
 import { splitLlvmLibraryProgram, splitLlvmProgram } from "./backend/llvm/split.js";
@@ -91,6 +91,7 @@ export {
   type FetchCompatProfile,
 } from "./compat/fetch-profile.js";
 export { LIB_FN_SIGS, validateModule } from "./ir/validate.js";
+export { deserializeModule, IR_VERSION, serializeModule } from "./ir/serialize.js";
 export { resolveLibraryFences, type LibraryFenceDecl, type ResolvedLibraryFence } from "./library/fence-eval.js";
 export {
   loadLibraryProfile,
@@ -150,11 +151,19 @@ export {
 } from "./frontend/provenance-registry.js";
 export * as ir from "./ir/ir.js";
 
-export interface CompileOptions {
-  /** Output executable path. Default: <outDir>/<stem>. */
+export type CompileOutputKind = "ir" | "c" | "llvm" | "exe";
+
+export interface CompileBaseOptions {
+  /** Primary artifact path. The CLI supplies the output-kind default. */
   outPath: string;
-  /** Where intermediates (program.c, program.ir.json) land. */
+  /** Where generated intermediates and compatibility side artifacts land. */
   outDir: string;
+  /** True only when outPath was selected by scriptc's default-path policy.
+   * This authorizes cleanup of stale generated siblings; explicit paths must
+   * leave neighboring caller-owned files untouched. */
+  defaultOutputPath?: boolean;
+  /** Compatibility-only additive IR side artifact for executable builds.
+   * The CLI's deprecated --emit-ir flag supplies this option. */
   emitIr?: boolean;
   sanitize?: boolean;
   /** Embed the dynamic-island engine (--dynamic). Off = the static default:
@@ -189,20 +198,78 @@ export interface CompileOptions {
    * the flag. */
   npmStatic?: readonly string[] | "auto";
   /** Outbound native FFI manifest. Its signature-only TypeScript bindings
-   * lower to direct C ABI calls, and its archive/system-library inputs are
-   * appended to the executable link. */
+   * lower to direct C ABI calls. Source outputs retain those declarations;
+   * archive/system-library inputs join only an executable link. */
   ffiProfilePath?: string;
 }
 
+/** Executable compile options. This remains the compatibility type for the
+ * historical compile() API, whose omitted output kind means executable. */
+export interface CompileOptions extends CompileBaseOptions {
+  outputKind?: "exe";
+}
+
+/** Source-artifact compile options, discriminated by the required kind. */
+export interface CompileSourceOptions extends CompileBaseOptions {
+  outputKind: Exclude<CompileOutputKind, "exe">;
+}
+
+/** Internal/dynamic request shape for callers that select the kind at runtime.
+ * Statically executable/source callers should prefer the narrower interfaces. */
+export interface CompileRequestOptions extends CompileBaseOptions {
+  outputKind?: CompileOutputKind;
+}
+
+export type CompileArtifact =
+  | { kind: "ir"; path: string }
+  | { kind: "c"; path: string }
+  | { kind: "llvm"; path: string }
+  | {
+      kind: "exe";
+      path: string;
+      translationUnitPath: string;
+      backend: "c" | "llvm";
+      llvmRefusal?: string;
+    };
+
+export type CompileFailure = {
+  ok: false;
+  diagnostics: ScrDiagnostic[];
+  sourceTexts: Map<string, string>;
+};
+
+export type CompileSourceResult =
+  | { ok: true; artifact: Extract<CompileArtifact, { kind: "ir" | "c" | "llvm" }> }
+  | CompileFailure;
+
+/** Historical executable result shape retained for source compatibility. */
 export type CompileResult =
+  | {
+      ok: true;
+      binaryPath: string;
+      cPath: string;
+      irPath?: string;
+      backend: "c" | "llvm";
+      llvmRefusal?: string;
+    }
+  | CompileFailure;
+
+export type CompileExecutableResult =
   /** `cPath` is the generated program TU next to the binary: the .ll under
    * the LLVM backend (the default lane), the .c under the C backend (same
    * seat, same lifecycle — --keep-c in the CLI governs both). `backend` is
    * the code generator that ACTUALLY emitted the TU; `llvmRefusal` is
    * present iff the default lane fell back to C, carrying the tier
-   * refusal's machine-readable kind tag ("stmt:...", "libCall:...", ...). */
-  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm"; llvmRefusal?: string }
-  | { ok: false; diagnostics: ScrDiagnostic[]; sourceTexts: Map<string, string> };
+   * refusal's machine-readable kind tag ("stmt:...", "libCall:...", ...).
+   * These top-level fields remain as compatibility aliases for callers
+   * written before the discriminated `artifact` result was introduced. */
+  | (Extract<CompileResult, { ok: true }> & {
+      artifact: Extract<CompileArtifact, { kind: "exe" }>;
+    })
+  | CompileFailure;
+
+/** Result union for callers that choose outputKind dynamically. */
+export type CompileRequestResult = CompileSourceResult | CompileExecutableResult;
 
 /** The LLVM backend's tier refusal as a diagnostic. SC3xxx = backend
  * coverage (the program is fine — this backend doesn't compile it yet);
@@ -367,6 +434,13 @@ export function buildTargetPlatform(env: NodeJS.ProcessEnv = process.env): strin
   } catch {
     return process.platform;
   }
+}
+
+/** Target-platform classification without compiler or SDK discovery. Source
+ * artifacts need target semantics for lowering, but do not need a native
+ * toolchain merely to decide whether that target is Windows, WASI, etc. */
+export function sourceTargetPlatform(env: NodeJS.ProcessEnv = process.env): string {
+  return configuredTargetPlatform(env);
 }
 
 export interface AnalyzeOptions {
@@ -860,11 +934,43 @@ function clearCompileSessionCaches(): void {
   clearFenceEvalCaches();
 }
 
-export async function compile(entryPath: string, opts: CompileOptions): Promise<CompileResult> {
+export function compile(
+  entryPath: string,
+  opts: CompileSourceOptions,
+): Promise<CompileSourceResult>;
+export function compile(
+  entryPath: string,
+  opts: CompileOptions,
+): Promise<CompileExecutableResult>;
+export function compile(entryPath: string, opts: CompileRequestOptions): Promise<CompileRequestResult>;
+export async function compile(entryPath: string, opts: CompileRequestOptions): Promise<CompileRequestResult> {
   clearCompileSessionCaches();
   const frontendInputs = new FrontendInputTracker();
   return frontendInputs.run(() => compileTracked(entryPath, opts, frontendInputs));
 }
+
+/** Build-time API compatibility fence: a caller's existing CompileOptions
+ * variable must retain the executable result aliases without narrowing. */
+async function assertCompileOptionsCompatibility(
+  entryPath: string,
+  opts: CompileOptions,
+): Promise<void> {
+  const result = await compile(entryPath, opts);
+  if (result.ok) {
+    const binaryPath: string = result.binaryPath;
+    void binaryPath;
+  }
+}
+void assertCompileOptionsCompatibility;
+
+/** The historical exported CompileResult itself remains executable-shaped. */
+function assertCompileResultCompatibility(result: CompileResult): void {
+  if (result.ok) {
+    const binaryPath: string = result.binaryPath;
+    void binaryPath;
+  }
+}
+void assertCompileResultCompatibility;
 
 function executableNativeFeatures(
   mod: IrModule,
@@ -977,10 +1083,11 @@ async function compileExecutableNative(
 
 async function compileTracked(
   entryPath: string,
-  opts: CompileOptions,
+  opts: CompileRequestOptions,
   frontendInputs: FrontendInputTracker,
-): Promise<CompileResult> {
+): Promise<CompileRequestResult> {
   entryPath = resolve(entryPath);
+  const outputKind = opts.outputKind ?? "exe";
   let ffi: FfiProfile | null = null;
   let ffiProfileBytes: Uint8Array | null = null;
   if (opts.ffiProfilePath !== undefined) {
@@ -992,12 +1099,29 @@ async function compileTracked(
     ffi = loaded.profile;
     ffiProfileBytes = loaded.profileBytes;
   }
-  const buildPlatform = buildTargetPlatform();
+  let buildPlatform: string;
+  if (outputKind === "exe") {
+    buildPlatform = buildTargetPlatform();
+  } else {
+    try {
+      buildPlatform = sourceTargetPlatform();
+    } catch (err) {
+      return {
+        ok: false,
+        diagnostics: [{
+          code: "SC3002",
+          message: err instanceof Error ? err.message : String(err),
+          loc: { file: entryPath, start: 0, end: 0 },
+        }],
+        sourceTexts: new Map(),
+      };
+    }
+  }
   // Mobile triples are library-mode targets: the archive an embedding app
   // links is the artifact, and only the library-admissible runtime surface
   // is verified on those device classes. The executable lane refuses before
   // any frontend work — a pure env check, so the refusal needs no toolchain.
-  {
+  if (outputKind === "exe") {
     const entryLoc: SrcLoc = { file: entryPath, start: 0, end: 0 };
     const mobileTarget = mobileLibraryTarget();
     if (mobileTarget !== null) {
@@ -1023,41 +1147,63 @@ async function compileTracked(
       };
     }
   }
-  const cacheRoot = provenanceSources() === null
+  const cacheRoot = outputKind === "exe" && provenanceSources() === null
     ? await prepareBuildCacheRoot(buildCacheRoot())
     : null;
-  const implementation = await compilerImplementationIdentity();
-  const earlyCacheOptions: EarlyExecutableCacheOptions = {
-    entryPath,
-    outDir: opts.outDir,
-    outPath: opts.outPath,
-    emitIr: opts.emitIr ?? false,
-    sanitize: opts.sanitize ?? false,
-    dynamic: opts.dynamic ?? false,
-    backend: opts.backend ?? "auto",
-    ...(opts.optimization === "dev" ? { optimization: "dev" as const } : {}),
-    npmStatic: opts.npmStatic ?? null,
-    ffiProfile:
-      opts.ffiProfilePath === undefined || ffiProfileBytes === null
-        ? null
-        : { path: opts.ffiProfilePath, bytes: ffiProfileBytes },
-    target: `${process.env["SCRIPTC_TARGET"] ?? "native"}:${buildPlatform}:${process.arch}`,
-    compiler: [process.env["SCRIPTC_CC"] ?? "clang"],
-    nativeEnvironment: await executableNativeEnvironmentFingerprint(),
-    nodeVersion: process.version,
-    implementation: implementation.digest,
-    implementationDependencies: implementation.dependencies,
-  };
-  const earlyHit = await readEarlyExecutableCache(cacheRoot, earlyCacheOptions);
+  let earlyCacheOptions: EarlyExecutableCacheOptions | null = null;
+  if (outputKind === "exe") {
+    const implementation = await compilerImplementationIdentity();
+    earlyCacheOptions = {
+      entryPath,
+      outDir: opts.outDir,
+      outPath: opts.outPath,
+      emitIr: opts.emitIr ?? false,
+      sanitize: opts.sanitize ?? false,
+      dynamic: opts.dynamic ?? false,
+      backend: opts.backend ?? "auto",
+      ...(opts.optimization === "dev" ? { optimization: "dev" as const } : {}),
+      npmStatic: opts.npmStatic ?? null,
+      ffiProfile:
+        opts.ffiProfilePath === undefined || ffiProfileBytes === null
+          ? null
+          : { path: opts.ffiProfilePath, bytes: ffiProfileBytes },
+      target: `${process.env["SCRIPTC_TARGET"] ?? "native"}:${buildPlatform}:${process.arch}`,
+      compiler: [process.env["SCRIPTC_CC"] ?? "clang"],
+      nativeEnvironment: await executableNativeEnvironmentFingerprint(),
+      nodeVersion: process.version,
+      implementation: implementation.digest,
+      implementationDependencies: implementation.dependencies,
+    };
+  }
+  const earlyHit = earlyCacheOptions === null
+    ? null
+    : await readEarlyExecutableCache(cacheRoot, earlyCacheOptions);
   if (earlyHit !== null) {
+    if (earlyCacheOptions === null) {
+      throw new InternalCompilerError("executable cache hit without executable cache options");
+    }
+    const executableCacheOptions = earlyCacheOptions;
+    if (!opts.emitIr) {
+      const stem = basename(entryPath).replace(/\.(ts|mts|cts|js|mjs|cjs)$/, "");
+      await rm(join(opts.outDir, `${stem}.ir.json`), { force: true });
+    }
     // Route/proof metadata is independently evictable. A full-compiler
     // fallback that still finds the validated payload repairs that lightweight
     // index so the next identical CLI invocation can avoid this module graph.
-    await publishEarlyExecutableRoute(cacheRoot, earlyCacheOptions).catch(() => undefined);
+    await publishEarlyExecutableRoute(cacheRoot, executableCacheOptions).catch(() => undefined);
     if (earlyHit.executableRestored) {
       await pruneBuildCache(cacheRoot);
       return {
         ok: true,
+        artifact: {
+          kind: "exe",
+          path: opts.outPath,
+          translationUnitPath: earlyHit.cPath,
+          backend: earlyHit.native.backend,
+          ...(earlyHit.native.llvmRefusal === undefined
+            ? {}
+            : { llvmRefusal: earlyHit.native.llvmRefusal }),
+        },
         binaryPath: opts.outPath,
         cPath: earlyHit.cPath,
         backend: earlyHit.native.backend,
@@ -1076,7 +1222,7 @@ async function compileTracked(
         ffi,
         null,
         async ({ dependencies }) => {
-          await publishEarlyExecutableCache(cacheRoot, earlyCacheOptions, {
+          await publishEarlyExecutableCache(cacheRoot, executableCacheOptions, {
             ...earlyHit,
             executableRestored: true,
             nativeDependencies: dependencies,
@@ -1100,6 +1246,15 @@ async function compileTracked(
     await pruneBuildCache(cacheRoot);
     return {
       ok: true,
+      artifact: {
+        kind: "exe",
+        path: opts.outPath,
+        translationUnitPath: earlyHit.cPath,
+        backend: earlyHit.native.backend,
+        ...(earlyHit.native.llvmRefusal === undefined
+          ? {}
+          : { llvmRefusal: earlyHit.native.llvmRefusal }),
+      },
       binaryPath: opts.outPath,
       cPath: earlyHit.cPath,
       backend: earlyHit.native.backend,
@@ -1116,7 +1271,7 @@ async function compileTracked(
   // The frontend (and its tsgo server) is released as soon as lowering
   // ends — clang and the link never hold it open.
   try {
-    const fail = (diagnostics: ScrDiagnostic[]): CompileResult => ({
+    const fail = (diagnostics: ScrDiagnostic[]): CompileFailure => ({
       ok: false,
       diagnostics,
       sourceTexts: fe.sourceTexts(),
@@ -1157,7 +1312,7 @@ async function compileTracked(
       if (unavailable !== null) {
         return fail([targetRefusalDiag("wasm32-wasi", unavailable.surface, unavailable.loc)]);
       }
-      if (opts.backend === "c") {
+      if (opts.backend === "c" || outputKind === "c") {
         const asyncSurface = moduleLibAsyncSurface(lowered.module);
         if (asyncSurface !== null) {
           return fail([
@@ -1172,14 +1327,69 @@ async function compileTracked(
     fe.dispose();
   }
 
+  const stem = basename(entryPath).replace(/\.(ts|mts|cts|js|mjs|cjs)$/, "");
+  const defaultSourcePaths = {
+    ir: join(opts.outDir, `${stem}.ir.json`),
+    c: join(opts.outDir, `${stem}.c`),
+    llvm: join(opts.outDir, `${stem}.ll`),
+  } as const;
+  const defaultExecutablePaths = [
+    join(opts.outDir, stem),
+    join(opts.outDir, `${stem}.exe`),
+    join(opts.outDir, `${stem}.wasm`),
+  ];
+  const removeStaleSourceArtifacts = async (keep: readonly string[]): Promise<void> => {
+    const kept = new Set(keep.map((path) => resolve(path)));
+    const candidates = outputKind === "exe"
+      ? Object.values(defaultSourcePaths)
+      : opts.defaultOutputPath === true
+        ? [...Object.values(defaultSourcePaths), ...defaultExecutablePaths]
+        : [];
+    await Promise.all(
+      candidates
+        .filter((path) => !kept.has(resolve(path)))
+        .map((path) => rm(path, { force: true })),
+    );
+  };
+
+  if (outputKind === "ir") {
+    await mkdir(dirname(opts.outPath), { recursive: true });
+    await writeFile(opts.outPath, serializeModule(lowered.module));
+    await removeStaleSourceArtifacts([opts.outPath]);
+    return { ok: true, artifact: { kind: "ir", path: opts.outPath } };
+  }
+
+  if (outputKind === "c") {
+    await mkdir(dirname(opts.outPath), { recursive: true });
+    await writeFile(opts.outPath, emitCModule(lowered.module, entryText));
+    await removeStaleSourceArtifacts([opts.outPath]);
+    return { ok: true, artifact: { kind: "c", path: opts.outPath } };
+  }
+
+  if (outputKind === "llvm") {
+    let llvm: string;
+    try {
+      llvm = emitLlvmModule(lowered.module, {
+        pointerBits: buildPlatform === "wasi" ? 32 : 64,
+        wasi: buildPlatform === "wasi",
+      });
+    } catch (err) {
+      if (!(err instanceof LlvmUnsupportedError)) throw err;
+      return { ok: false, diagnostics: [llvmRefusalDiag(err, entryPath)], sourceTexts };
+    }
+    await mkdir(dirname(opts.outPath), { recursive: true });
+    await writeFile(opts.outPath, llvm);
+    await removeStaleSourceArtifacts([opts.outPath]);
+    return { ok: true, artifact: { kind: "llvm", path: opts.outPath } };
+  }
+
   await mkdir(opts.outDir, { recursive: true });
-  const stem = basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "");
   // Both backends hang off the same in-memory IrModule (never the JSON
   // dump); the LLVM backend's .ll takes the .c's seat on the exact clang
   // command line below — compileC accepts either. The default lane tries
   // LLVM first; a tier refusal retries ONLY the emit with the C backend
   // (the frontend ran once, the IR is backend-agnostic — nothing recompiles).
-  let cPath = join(opts.outDir, `${stem}.c`);
+  let cPath = defaultSourcePaths.c;
   let backend: "c" | "llvm" = "c";
   let llvmSource: string | null = null;
   let llvmRefusal: string | undefined;
@@ -1189,7 +1399,7 @@ async function compileTracked(
         pointerBits: buildPlatform === "wasi" ? 32 : 64,
         wasi: buildPlatform === "wasi",
       });
-      cPath = join(opts.outDir, `${stem}.ll`);
+      cPath = defaultSourcePaths.llvm;
       await writeFile(cPath, ll);
       llvmSource = ll;
       backend = "llvm";
@@ -1210,13 +1420,15 @@ async function compileTracked(
   // so a lane change would leave the PREVIOUS lane's TU beside the fresh
   // one — remove the loser so the surviving TU is always the one the
   // binary below was linked from.
-  await rm(join(opts.outDir, `${stem}${backend === "llvm" ? ".c" : ".ll"}`), { force: true });
-
   let irPath: string | undefined;
   if (opts.emitIr) {
-    irPath = join(opts.outDir, `${stem}.ir.json`);
+    irPath = defaultSourcePaths.ir;
     await writeFile(irPath, serializeModule(lowered.module));
   }
+  await removeStaleSourceArtifacts([
+    cPath,
+    ...(irPath === undefined ? [] : [irPath]),
+  ]);
 
   const nativeFeatures = executableNativeFeatures(
     lowered.module,
@@ -1231,6 +1443,10 @@ async function compileTracked(
       ? splitLlvmProgram(llvmSource)
       : null;
   await mkdir(dirname(opts.outPath), { recursive: true });
+  if (earlyCacheOptions === null) {
+    throw new InternalCompilerError("executable emission without executable cache options");
+  }
+  const executableCacheOptions = earlyCacheOptions;
   let publishedExecutable = false;
   try {
     await compileExecutableNative(
@@ -1241,7 +1457,7 @@ async function compileTracked(
       ffi,
       programSplit,
       async ({ dependencies }) => {
-        await publishEarlyExecutableCache(cacheRoot, earlyCacheOptions, {
+        await publishEarlyExecutableCache(cacheRoot, executableCacheOptions, {
           cPath,
           native: nativeFeatures,
           executableRestored: true,
@@ -1268,7 +1484,7 @@ async function compileTracked(
     throw err;
   }
   if (!publishedExecutable) {
-    await publishEarlyExecutableCache(cacheRoot, earlyCacheOptions, {
+    await publishEarlyExecutableCache(cacheRoot, executableCacheOptions, {
       cPath,
       native: nativeFeatures,
       executableRestored: false,
@@ -1279,6 +1495,13 @@ async function compileTracked(
   await pruneBuildCache(cacheRoot);
   return {
     ok: true,
+    artifact: {
+      kind: "exe",
+      path: opts.outPath,
+      translationUnitPath: cPath,
+      backend,
+      ...(llvmRefusal !== undefined ? { llvmRefusal } : {}),
+    },
     binaryPath: opts.outPath,
     cPath,
     backend,
@@ -1824,7 +2047,7 @@ async function emitSemanticLibraryHit(
     };
   }
   await mkdir(opts.outDir, { recursive: true });
-  const stem = basename(profile.entry).replace(/\.(ts|js|mjs|cjs)$/, "");
+  const stem = basename(profile.entry).replace(/\.(ts|mts|cts|js|mjs|cjs)$/, "");
   const cPath = join(opts.outDir, `${stem}.lib.${profile.emission === "llvm" ? "ll" : "c"}`);
   let translationUnit = hit.translationUnit;
   if (profile.sidecar !== null) {
@@ -1938,7 +2161,7 @@ async function compileLibraryTracked(
   }
   const archivePath = opts.outPath ?? join(
     opts.outDir,
-    `${basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "")}.lib.a`,
+    `${basename(entryPath).replace(/\.(ts|mts|cts|js|mjs|cjs)$/, "")}.lib.a`,
   );
 
   // Mobile-target admission first — a pure env/host check, so a refused
@@ -2297,7 +2520,7 @@ async function compileLibraryTracked(
   timing("ir-validate");
 
   await mkdir(opts.outDir, { recursive: true });
-  const stem = basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "");
+  const stem = basename(entryPath).replace(/\.(ts|mts|cts|js|mjs|cjs)$/, "");
   let cPath: string;
   if (profile.emission === "llvm") {
     try {

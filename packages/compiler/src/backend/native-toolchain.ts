@@ -764,9 +764,9 @@ export function resolveCc(
     throw new Error(`unknown SCRIPTC_CC '${cc}' (supported: clang, zigcc)`);
   }
   if (target === "") return { argv: ["zig", "cc"], target: null, zigTarget: null, ...hostArgs };
-  if (target.includes("wasi") && target !== "wasm32-wasi") {
-    throw new Error(`unsupported WASI target '${target}' (supported: wasm32-wasi)`);
-  }
+  // Validate the target spelling before any SDK/sysroot discovery. Source
+  // emission uses the same pure classifier without resolving this driver.
+  configuredTargetPlatform(env, hostPlatform);
   const mobileRefusal = mobileTargetRefusal(target, hostPlatform);
   if (mobileRefusal !== null) throw new Error(mobileRefusal);
   if (isIosTarget(target)) {
@@ -847,16 +847,37 @@ function isMuslTarget(driver: Pick<CcDriver, "target">): boolean {
  * analyze(): the FRONTEND consults it too (path.sep / os.EOL literals and
  * the path-module binding follow the target — a win32 triple compiles
  * Node-on-Windows semantics, path.win32 backing the bare module). */
-export function targetPlatform(driver: CcDriver): string {
-  if (driver.target === null) return process.platform;
-  if (driver.target.includes("wasi")) return "wasi";
+export function configuredTargetPlatform(
+  env: NodeJS.ProcessEnv = process.env,
+  hostPlatform: NodeJS.Platform = process.platform,
+): string {
+  const target = env["SCRIPTC_TARGET"] ?? "";
+  if (target === "") return hostPlatform;
+  if (target === "wasm32-wasi") return "wasi";
+  if (target.includes("wasi")) {
+    throw new Error(`unsupported WASI target '${target}' (supported: wasm32-wasi)`);
+  }
   // iOS is a darwin-family target: Mach-O objects, ld64 localization,
   // POSIX path/EOL semantics. Android falls to the linux arm below —
   // bionic is a linux libc and its archives are ordinary ELF.
-  if (isIosTarget(driver.target)) return "darwin";
-  if (driver.target.includes("linux")) return "linux";
-  if (driver.target.includes("windows")) return "win32";
-  return driver.target.includes("macos") || driver.target.includes("darwin") ? "darwin" : "other";
+  if (isIosTarget(target)) return "darwin";
+  if (isAndroidTarget(target)) return "linux";
+  if (/(?:^|-)(?:ios|tvos|watchos|visionos|android)/.test(target)) {
+    throw new Error(
+      `unsupported mobile target '${target}' (supported: ${MOBILE_LIBRARY_TARGETS.join(", ")})`,
+    );
+  }
+  if (target.includes("linux")) return "linux";
+  if (target.includes("windows")) return "win32";
+  if (target.includes("macos") || target.includes("darwin")) return "darwin";
+  throw new Error(
+    `unsupported target '${target}' (supported OS families: linux, windows, macos/darwin, wasm32-wasi)`,
+  );
+}
+
+export function targetPlatform(driver: CcDriver): string {
+  if (driver.target === null) return process.platform;
+  return configuredTargetPlatform({ SCRIPTC_TARGET: driver.target });
 }
 
 /** Architecture identity for host-native cache entries. Explicit cross targets
