@@ -3,11 +3,9 @@
 import { spawn } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
 import { enableCompileCache } from "node:module";
-import { arch } from "node:process";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { hostSupportsRuntimePack } from "../scripts/runtime-pack-host.mjs";
 import { LEGACY_C_EXECUTABLE_WARNING, shouldWarnLegacyCExecutable } from "./legacy-c-warning.js";
 import { CLI_OPTIONS, USAGE } from "./usage.js";
 
@@ -83,7 +81,7 @@ async function tryFastPath(): Promise<number | null> {
   let buildPlatform: string;
   try {
     startup = await import("@scriptc/compiler/startup-cache");
-    buildPlatform = startup.targetPlatform(startup.resolveCc());
+    buildPlatform = startup.configuredTargetPlatform();
   } catch {
     return null;
   }
@@ -101,16 +99,21 @@ async function tryFastPath(): Promise<number | null> {
   const ffiBytes = ffiPath === null ? null : await readFile(ffiPath).catch(() => null);
   if (ffiPath !== null && ffiBytes === null) return null;
   const root = await startup.prepareBuildCacheRoot(startup.resolveBuildCacheRoot());
-  const helperObjectRoute = hostSupportsRuntimePack(process.platform, arch) &&
-    (process.env["SCRIPTC_TARGET"] ?? "") === "" &&
-    backend !== "c" && !values.sanitize &&
-    process.env["SCRIPTC_RUNTIME_PACK"] !== "0" &&
-    process.env["SCRIPTC_FETCH_CURL"] !== "1" &&
-    !startup.legacyCExecutablePathRequested();
+  // This must exactly mirror the ordinary LLVM executable's route in the
+  // full compiler. Otherwise a valid helper/runtime-pack cache entry has a
+  // different target/compiler identity and bootstrap must unnecessarily load
+  // the whole compiler graph to rediscover it.
+  const helperRuntimePackTarget = backend !== "c" && !values.sanitize
+    ? startup.precompiledRuntimePackTarget()
+    : null;
+  const helperObjectRoute = helperRuntimePackTarget !== null;
   let nativeEnvironment: string | null;
   try {
     nativeEnvironment = helperObjectRoute
-      ? await startup.executableLinkerEnvironmentFingerprint()
+      ? await startup.executableLinkerEnvironmentFingerprint(
+        process.env,
+        helperRuntimePackTarget.defaultLinker,
+      )
       : await startup.executableNativeEnvironmentFingerprint();
   } catch {
     nativeEnvironment = null;
@@ -127,10 +130,12 @@ async function tryFastPath(): Promise<number | null> {
     ...(optimization === "dev" ? { optimization: "dev" as const } : {}),
     npmStatic,
     ffiProfile: ffiPath === null ? null : { path: ffiPath, bytes: ffiBytes! },
-    target: `${process.env["SCRIPTC_TARGET"] ?? "native"}:${buildPlatform}:${arch}:${
+    target: `${process.env["SCRIPTC_TARGET"] ?? "native"}:${buildPlatform}:${process.arch}:${
       helperObjectRoute ? "runtime-pack" : "driver-tu"
     }`,
-    compiler: [helperObjectRoute ? startup.resolvePlatformLinker() : (process.env["SCRIPTC_CC"] ?? "clang")],
+    compiler: [helperObjectRoute
+      ? startup.resolvePlatformLinker(process.env, helperRuntimePackTarget.defaultLinker)
+      : (process.env["SCRIPTC_CC"] ?? "clang")],
     nativeEnvironment,
     nodeVersion: process.version,
   });
