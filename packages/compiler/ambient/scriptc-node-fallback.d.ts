@@ -921,15 +921,17 @@ declare module "module" {
   export * from "node:module";
 }
 /* import.meta: module-loader metadata with no value representation —
- * every read fences (SC1090) EXCEPT as createRequire's base, where it
- * only NAMES the containing file (import.meta.url, import.meta.filename,
- * and __filename all mean "this file" there). Declared so the pattern
- * typechecks under the fallback surface; @types/node's own augmentation
- * stands in when adopted. */
+ * direct file-backed fields lower to constants, while the object and
+ * remaining members fence (SC1090) EXCEPT as createRequire's base, where it
+ * only NAMES the containing file. Declared so unsupported forms reach their
+ * named lowering fences; @types/node's own augmentation stands in when
+ * adopted. */
 interface ImportMeta {
   url: string;
   filename: string;
   dirname: string;
+  main: boolean;
+  resolve(specifier: string, parent?: string | URL): string;
 }
 
 /* The synchronous node:fs surface — utf8-only, no options objects, no

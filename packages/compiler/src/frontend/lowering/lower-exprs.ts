@@ -7,6 +7,7 @@ import { InternalCompilerError } from "../../errors.js";
  * (FieldTarget). */
 import * as ts from "../ts7/adapter.js";
 import { dirname, posix } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { Lowerer } from "./lowerer.js";
 import { wasiGuestPath } from "../../wasi-paths.js";
 import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/ir.js";
@@ -778,9 +779,7 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
         // directory at `/tmp`. Bake the matching GUEST spelling so resource
         // lookups relative to these CommonJS globals stay inside the exposed
         // capability instead of naming an unreachable host-absolute path.
-        const fileName = lowerer.targetPlatform === "wasi"
-          ? wasiGuestPath(sf.fileName) ?? sf.fileName.replace(/\\/g, "/")
-          : sf.fileName;
+        const fileName = moduleFileName(lowerer, sf);
         const value = expr.text === "__dirname"
           ? (lowerer.targetPlatform === "wasi" ? posix.dirname(fileName) : dirname(fileName))
           : fileName;
@@ -1324,6 +1323,14 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
         const en = lowerEnumAccess(lowerer, expr);
         if (en) return en;
       }
+      // `import.meta.<field>` — the file-backed ESM metadata that survives
+      // compilation as a constant. Only direct, identifier-named reads are
+      // claimed here; the bare meta object, computed access, writes, and
+      // unsupported members continue through the generic module-loader fence
+      // below. The source file is the module identity, so imported modules
+      // receive their own filename/dirname and only the entry receives main.
+      const importMeta = importMetaProperty(lowerer, expr);
+      if (importMeta) return importMeta;
       // `require.main.filename` / `require.main?.filename` — CommonJS
       // entry-module identity: in a compiled binary require.main IS the
       // entry module (never undefined in a CJS graph, so the chain's guard
@@ -1915,6 +1922,55 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
     const entry = UNSUPPORTED_EXPR[expr.kind];
     if (entry) lowerer.unsupported(entry.code as `SC${number}` & keyof typeof UNSUPPORTED, expr, entry.feature);
     lowerer.unsupported("SC1090", expr, `syntax '${ts.SyntaxKind[expr.kind]}'`);
+  }
+
+  function moduleFileName(lowerer: Lowerer, sf: ts.SourceFile): string {
+    return lowerer.targetPlatform === "wasi"
+      ? wasiGuestPath(sf.fileName) ?? sf.fileName.replace(/\\/g, "/")
+      : sf.fileName;
+  }
+
+  function importMetaProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (expr.questionDotToken !== undefined || !ts.isMetaProperty(expr.expression)) return null;
+    const meta = expr.expression;
+    if (meta.keywordToken !== ts.SyntaxKind.ImportKeyword || meta.name.text !== "meta") return null;
+
+    const sf = expr.getSourceFile();
+    const fileName = moduleFileName(lowerer, sf);
+    if (lowerer.dynamic) {
+      lowerer.unsupported(
+        "SC1090",
+        expr,
+        `'import.meta.${expr.name.text}' in a dynamic island (module-loader metadata is supported only in static ESM)`,
+      );
+    }
+    switch (expr.name.text) {
+      case "url":
+        return {
+          kind: "strLit",
+          value: pathToFileURL(fileName, { windows: lowerer.targetPlatform === "win32" }).href,
+          type: STRING,
+          loc: locOf(expr),
+        };
+      case "filename":
+        return { kind: "strLit", value: fileName, type: STRING, loc: locOf(expr) };
+      case "dirname":
+        return {
+          kind: "strLit",
+          value: lowerer.targetPlatform === "wasi" ? posix.dirname(fileName) : dirname(fileName),
+          type: STRING,
+          loc: locOf(expr),
+        };
+      case "main":
+        return { kind: "boolLit", value: sf === lowerer.entry, type: BOOL, loc: locOf(expr) };
+      default:
+        lowerer.unsupported(
+          "SC1090",
+          expr,
+          `'import.meta.${expr.name.text}' (only url, filename, dirname, and main are supported in static ESM)`,
+        );
+        return null;
+    }
   }
 
 /** `c ? a : b` — see the inline comments. `expected` plays the contextual

@@ -9,9 +9,9 @@
       "static": {
         "replace-refusal": 73,
         "verify-gap": 2764,
-        "audit-partial": 367,
-        "classify": 4,
-        "implement": 96
+        "audit-partial": 371,
+        "classify": 3,
+        "implement": 93
       },
       "dynamic": {
         "audit-partial": 745,
@@ -60334,12 +60334,14 @@
       "priority": "high",
       "tiers": {
         "static": {
-          "status": "not-implemented",
-          "action": "implement",
-          "verification": "declared-gap",
-          "confidence": "medium",
+          "status": "partial",
+          "action": "audit-partial",
+          "verification": "test-backed",
+          "confidence": "high",
           "source": "compiler-feature:esm.dirname",
-          "tests": []
+          "tests": [
+            "tests/corpus/2701-import-meta/main.mjs"
+          ]
         },
         "dynamic": {
           "status": "not-implemented",
@@ -60367,12 +60369,14 @@
       "priority": "high",
       "tiers": {
         "static": {
-          "status": "not-implemented",
-          "action": "implement",
-          "verification": "declared-gap",
-          "confidence": "medium",
+          "status": "partial",
+          "action": "audit-partial",
+          "verification": "test-backed",
+          "confidence": "high",
           "source": "compiler-feature:esm.filename",
-          "tests": []
+          "tests": [
+            "tests/corpus/2701-import-meta/main.mjs"
+          ]
         },
         "dynamic": {
           "status": "not-implemented",
@@ -60400,12 +60404,14 @@
       "priority": "high",
       "tiers": {
         "static": {
-          "status": "unreviewed",
-          "action": "classify",
-          "verification": "unreviewed",
-          "confidence": "low",
-          "source": null,
-          "tests": []
+          "status": "partial",
+          "action": "audit-partial",
+          "verification": "test-backed",
+          "confidence": "high",
+          "source": "compiler-feature:esm.url",
+          "tests": [
+            "tests/corpus/2701-import-meta/main.mjs"
+          ]
         },
         "dynamic": {
           "status": "partial",
@@ -60436,12 +60442,14 @@
       "priority": "low",
       "tiers": {
         "static": {
-          "status": "not-implemented",
-          "action": "implement",
-          "verification": "declared-gap",
-          "confidence": "medium",
+          "status": "partial",
+          "action": "audit-partial",
+          "verification": "test-backed",
+          "confidence": "high",
           "source": "compiler-feature:esm.main",
-          "tests": []
+          "tests": [
+            "tests/corpus/2701-import-meta/main.mjs"
+          ]
         },
         "dynamic": {
           "status": "not-implemented",

@@ -699,11 +699,11 @@
       "apiEntries": 22,
       "static": {
         "supported": 0,
-        "partial": 7,
+        "partial": 11,
         "refused": 0,
-        "not-implemented": 14,
+        "not-implemented": 11,
         "by-design": 0,
-        "unreviewed": 1,
+        "unreviewed": 0,
         "not-applicable": 0
       },
       "dynamic": {
@@ -74920,6 +74920,7 @@
         "evidence": "derived:descendants",
         "tests": [
           "tests/corpus/2646-top-level-await.ts",
+          "tests/corpus/2701-import-meta/main.mjs",
           "tests/corpus/950-modules-basic/main.ts"
         ]
       },
@@ -75005,8 +75006,11 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-feature:esm.dirname"
+        "status": "partial",
+        "evidence": "compiler-feature:esm.dirname",
+        "tests": [
+          "tests/corpus/2701-import-meta/main.mjs"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -75032,8 +75036,11 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-feature:esm.filename"
+        "status": "partial",
+        "evidence": "compiler-feature:esm.filename",
+        "tests": [
+          "tests/corpus/2701-import-meta/main.mjs"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -75059,7 +75066,11 @@
         "inherited": true
       },
       "static": {
-        "status": "unreviewed"
+        "status": "partial",
+        "evidence": "compiler-feature:esm.url",
+        "tests": [
+          "tests/corpus/2701-import-meta/main.mjs"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -75089,8 +75100,11 @@
         "inherited": false
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-feature:esm.main"
+        "status": "partial",
+        "evidence": "compiler-feature:esm.main",
+        "tests": [
+          "tests/corpus/2701-import-meta/main.mjs"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
