@@ -19,6 +19,7 @@ import { compile } from "@scriptc/compiler";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
+const fixturesRoot = join(repoRoot, "tests/fixtures");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 
@@ -66,6 +67,32 @@ async function compileAndRun(name: string, source: string): Promise<RunResult> {
   }
 }
 
+/** Compiles and runs a fixture whose imports must be embedded from npm. */
+async function compileFixtureAndRun(name: string, entry: string): Promise<RunResult> {
+  const outDir = join(cacheDir, `web-${name}`);
+  mkdirSync(outDir, { recursive: true });
+  const result = await compile(entry, {
+    outPath: join(outDir, name),
+    outDir,
+    sanitize,
+    dynamic: true,
+  });
+  if (!result.ok) {
+    throw new Error(
+      "web-globals fixture failed to compile:\n" +
+        result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"),
+    );
+  }
+  try {
+    const { stdout, stderr } = await execFileAsync(result.binaryPath, [], { encoding: "utf8" });
+    return { stdout, stderr, exitCode: 0 };
+  } catch (err) {
+    const e = err as { code?: unknown; stdout?: string; stderr?: string };
+    if (typeof e.code !== "number") throw err;
+    return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", exitCode: e.code };
+  }
+}
+
 /** Evaluates island code that must produce a one-line string. */
 async function islandEval(name: string, js: string): Promise<string> {
   const r = await compileAndRun(name, `console.log(__island_eval(${JSON.stringify(js)}));\n`);
@@ -83,8 +110,10 @@ describe(`island web globals (scriptc-only${sanitize ? ", sanitized" : ""})`, ()
         typeof TextDecoder, typeof TextDecoderStream, typeof URLSearchParams,
         typeof btoa, typeof atob, typeof Headers, typeof crypto, typeof console,
         typeof Blob, typeof File, typeof Event, typeof EventTarget, typeof CustomEvent,
+        typeof MessageEvent,
         typeof WritableStream, typeof structuredClone, typeof FormData,
-        typeof WebSocket,
+        typeof WebSocket, typeof URL, typeof Buffer, typeof setImmediate,
+        typeof clearImmediate,
       ].join(' ')`,
     );
     // Blob/File and the Event triple joined the subset when the vercel
@@ -92,12 +121,24 @@ describe(`island web globals (scriptc-only${sanitize ? ", sanitized" : ""})`, ()
     // Event and buffer.Blob at LOAD); structuredClone joined with the
     // globals lane (the HTML StructuredSerialize subset, cycles
     // included); WritableStream/FormData/WebSocket stay fenced by
-    // absence.
+    // absence. URL, Buffer, and the immediate-timer globals are installed
+    // only when the embedded npm module bootstrap runs.
     expect(out).toBe(
-      "function function function function function function " +
-        "function function function object object " +
-        "function function function function function " +
-        "undefined function undefined undefined",
+      "function function function function function function function function function " +
+        "object object function function function function function function " +
+        "undefined function undefined undefined undefined undefined undefined undefined",
+    );
+  });
+
+  test("node:stream/web exposes only the implemented module constructors", async () => {
+    const result = await compileFixtureAndRun(
+      "web-stream-module-presence",
+      join(fixturesRoot, "npm/divergent/web-stream-module-presence.ts"),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.trimEnd()).toBe(
+      "function function function function function function function false false false false false false false",
     );
   });
 
